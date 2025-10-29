@@ -10,5 +10,9 @@ tokenizer = AutoTokenizer.from_pretrained("./model/deadpool-gpt2")
 def home():
     return "Hello, Flask!"
 
+@app.route('/generate')
+def generate():
+    return "Test"
+
 if __name__ == '__main__':
     app.run(debug=True)
