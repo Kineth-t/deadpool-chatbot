@@ -10,9 +10,31 @@ tokenizer = AutoTokenizer.from_pretrained("./model/deadpool-gpt2")
 def home():
     return "Hello, Flask!"
 
-@app.route('/generate')
+@app.route('/generate', methods=['POST'])
 def generate():
-    return "Test"
+    data = request.get_json()
+    prompt = data.get("input", "")
+
+    if not prompt:
+        return jsonify({"error": "No input provided"}), 400
+
+    # Encode input
+    inputs = tokenizer.encode(prompt, return_tensors="pt")
+
+    # Generate output
+    outputs = model.generate(
+        inputs,
+        max_length=100,
+        temperature=0.9,
+        top_p=0.95,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+    # Decode generated text
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    return jsonify({"response": generated_text})
 
 if __name__ == '__main__':
     app.run(debug=True)
