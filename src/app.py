@@ -18,12 +18,12 @@ def generate():
     if not prompt:
         return jsonify({"error": "No input provided"}), 400
 
-    # Encode input
-    inputs = tokenizer.encode(prompt, return_tensors="pt")
+    # Encode input properly
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
 
     # Generate output
     outputs = model.generate(
-        inputs,
+        **inputs,
         max_length=100,
         temperature=0.9,
         top_p=0.95,
