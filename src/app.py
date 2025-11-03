@@ -33,8 +33,9 @@ def generate():
 
     # Decode generated text
     generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    response = generated_text.split("Response:")[-1].strip()
 
-    return jsonify({"response": generated_text})
+    return jsonify({"response": response})
 
 if __name__ == '__main__':
     app.run(debug=True)
