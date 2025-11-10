@@ -19,6 +19,8 @@ def generate():
 
     if not prompt:
         return jsonify({"error": "No input provided"}), 400
+    
+    print(prompt)
 
     # Encode input properly
     inputs = tokenizer(prompt, return_tensors="pt", padding=True)
