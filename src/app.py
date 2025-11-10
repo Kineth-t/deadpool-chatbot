@@ -12,8 +12,10 @@ def home():
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    data = request.get_json()
-    prompt = data.get("input", "")
+    prompt = request.form.get("input") or request.json.get("input")
+
+    if not prompt:
+        return jsonify({"error": "No input provided"}), 400
 
     if not prompt:
         return jsonify({"error": "No input provided"}), 400
@@ -35,7 +37,11 @@ def generate():
     generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
     response = generated_text.split("Response:")[-1].strip()
 
-    return jsonify({"response": response})
+    # If request is from the template form, return to template
+    if request.form.get("input"):
+        return render_template("index.html", prompt=prompt, response=response)
+    else:
+        return jsonify({"response": response})
 
 if __name__ == '__main__':
     app.run(debug=True)
