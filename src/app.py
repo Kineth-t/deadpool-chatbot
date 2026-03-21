@@ -1,49 +1,84 @@
 from flask import Flask, request, jsonify, render_template
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import re
-import random
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain.llms import HuggingFacePipeline
+from langchain.memory import ConversationSummaryMemory
+from langchain.chains import ConversationChain
+from langchain.prompts import PromptTemplate
+from peft import PeftModel
+
+import torch
 
 app = Flask(__name__)
 
-# Load model and tokenizer once
-model = AutoModelForCausalLM.from_pretrained("./model/deadpool-gpt2")
-tokenizer = AutoTokenizer.from_pretrained("./model/deadpool-gpt2")
+model_name = "mistralai/Mistral-7B-Instruct-v0.2"
 
-# Global conversation memory
-conversation_history = ""
+# 1. LOAD MODEL
+base_model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    dtype=torch.float16,
+    low_cpu_mem_usage=True
+)
 
-# Limit history size to prevent overflow
-MAX_HISTORY_CHARS = 2000
+model = PeftModel.from_pretrained(
+    base_model,
+    "./model/deadpool-lora"
+)
 
+tokenizer = AutoTokenizer.from_pretrained("./model/deadpool-lora")
+tokenizer.pad_token = tokenizer.eos_token
 
-# Helper Functions
-def clean_response(text):
-    """Extract last complete sentence"""
-    text = text.strip()
-    match = re.search(r'(.+[.!?])', text)
-    return match.group(1) if match else text
+pipe = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=120,
+    temperature=0.9,
+    top_p=0.9,
+    repetition_penalty=1.2,
+    do_sample=True,
+    pad_token_id=tokenizer.eos_token_id
+)
 
-
-def ensure_sentence_end(text):
-    """Ensure response ends with proper punctuation"""
-    text = text.strip()
-
-    if not text:
-        return text
-
-    if text[-1] not in {'.', '!', '?'}:
-        text += random.choice(['.', '!', '?'])
-
-    return text
-
-
-def trim_history(history):
-    """Keep only recent part of conversation"""
-    return history[-MAX_HISTORY_CHARS:]
+llm = HuggingFacePipeline(pipeline=pipe)
 
 
+# 2. MEMORY (AUTO MANAGED)
+memory = ConversationSummaryMemory(
+    llm=llm,
+    return_messages=False
+)
 
-# Routes
+
+# 3. DEADPOOL PROMPT
+template = """
+You are Deadpool (Wade Wilson).
+
+You are sarcastic, chaotic, funny, and break the fourth wall.
+You mock the user and make ridiculous jokes.
+
+Conversation so far:
+{history}
+
+User: {input}
+Deadpool:
+"""
+
+prompt = PromptTemplate(
+    input_variables=["history", "input"],
+    template=template
+)
+
+
+# 4. CONVERSATION CHAIN
+conversation = ConversationChain(
+    llm=llm,
+    memory=memory,
+    prompt=prompt,
+    verbose=False
+)
+
+
+# ROUTES
 @app.route('/')
 def home():
     return render_template('index.html')
@@ -51,57 +86,26 @@ def home():
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    global conversation_history
+    data = request.get_json() or request.form
+    user_input = data.get("input")
 
-    prompt = request.form.get("input") or request.json.get("input")
-
-    if not prompt:
+    if not user_input:
         return jsonify({"error": "No input provided"}), 400
 
-    print(f"User: {prompt}")
+    print(f"User: {user_input}")
 
-    # Append user input
-    conversation_history += f"\n### User:\n{prompt}\n### Assistant:\n"
+    # Generate response via LangChain
+    response = conversation.predict(input=user_input).strip()
 
-    # Trim history
-    conversation_history = trim_history(conversation_history)
-
-    # Tokenize full conversation
-    inputs = tokenizer(conversation_history, return_tensors="pt", padding=True)
-
-    # Generate continuation
-    outputs = model.generate(
-        **inputs,
-        max_length=inputs["input_ids"].shape[1] + 100,
-        temperature=0.9,
-        top_p=0.9,
-        repetition_penalty=1.2,
-        no_repeat_ngram_size=3,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id
-    )
-
-    # Decode output
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-    # Extract ONLY the new response
-    new_response = generated_text[len(conversation_history):].strip()
-
-    # Clean + fix sentence ending
-    new_response = clean_response(new_response)
-    new_response = ensure_sentence_end(new_response)
-
-    print(f"Bot: {new_response}")
-
-    # Append assistant response
-    conversation_history += f"{new_response}\n"
+    print(f"Deadpool: {response}")
 
     # Return response
     if request.form.get("input"):
-        return render_template("index.html", prompt=prompt, response=new_response)
+        return render_template("index.html", prompt=user_input, response=response)
     else:
-        return jsonify({"response": new_response})
+        return jsonify({"response": response})
 
-# Run App
+
+# RUN
 if __name__ == '__main__':
     app.run(debug=True)
