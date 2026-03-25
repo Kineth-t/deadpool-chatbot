@@ -5,33 +5,30 @@ import torch
 import os
 import json
 import re
-
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain.llms.base import LLM
 from langchain.schema import LLMResult, Generation
 from typing import Any, List, Optional
 
+
 app = Flask(__name__)
 
-# ──────────────────────────────────────────────
 # 1. DEVICE
-# ──────────────────────────────────────────────
 device = torch.device("cpu")
 print(f"Using device: {device}")
 
-# ──────────────────────────────────────────────
+
 # 2. TOKENIZER
-# ──────────────────────────────────────────────
 BASE_MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ADAPTER_PATH    = "./model/deadpool-llama"
+
 
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
 tokenizer.pad_token = tokenizer.eos_token
 
-# ──────────────────────────────────────────────
+
 # 3. BASE MODEL (summarizer)
-# ──────────────────────────────────────────────
 print("Loading base model...")
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_NAME, dtype=torch.float32, low_cpu_mem_usage=True,
@@ -39,9 +36,8 @@ base_model = AutoModelForCausalLM.from_pretrained(
 base_model.eval()
 base_model = base_model.to(device)
 
-# ──────────────────────────────────────────────
+
 # 4. DEADPOOL MODEL (base + LoRA)
-# ──────────────────────────────────────────────
 adapter_ok = False
 
 if os.path.isdir(ADAPTER_PATH):
@@ -85,9 +81,8 @@ else:
 
 print("Models loaded!\n")
 
-# ──────────────────────────────────────────────
+
 # 5. SANITIZER
-# ──────────────────────────────────────────────
 SPECIAL_TOKEN_RE = re.compile(r'<\|[^|]+\|>|</s>|<s>')
 JUNK_RE          = re.compile(r'[®™©♥♦♠♣♤♡♢♧]|[\U0001F300-\U0001F9FF]|\n{2,}', re.UNICODE)
 
@@ -97,9 +92,8 @@ def sanitize(text: str) -> str:
     text = re.split(r'https?://\S+|www\.\S+|\S+\.com\S*', text)[0]
     return " ".join(text.split()).strip()
 
-# ──────────────────────────────────────────────
+
 # 6. GENERATION
-# ──────────────────────────────────────────────
 STOP_STRINGS = [
     "<|user|>", "<|system|>", "<|assistant|>",
     "\nUser:", "\nAssistant:",
@@ -143,9 +137,8 @@ def deadpool_generate(prompt: str) -> str:
 def summarizer_generate(prompt: str) -> str:
     return _decode(base_model, prompt, max_new_tokens=120, temperature=0.3, min_new_tokens=10)
 
-# ──────────────────────────────────────────────
+
 # 7. LANGCHAIN WRAPPER (summarizer only)
-# ──────────────────────────────────────────────
 class SummarizerLLM(LLM):
 
     @property
@@ -163,9 +156,8 @@ class SummarizerLLM(LLM):
 
 summarizer_llm = SummarizerLLM()
 
-# ──────────────────────────────────────────────
+
 # 8. MEMORY
-# ──────────────────────────────────────────────
 conversation_history: list = []
 MAX_RECENT_TURNS = 6
 
@@ -178,9 +170,8 @@ memory = ConversationSummaryBufferMemory(
     return_messages=False,
 )
 
-# ──────────────────────────────────────────────
+
 # 9. SYSTEM PROMPT
-# ──────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "You are Deadpool, a.k.a. Wade Wilson — the Merc with a Mouth. "
     "You are NOT an AI, NOT a chatbot, NOT an assistant. You ARE Wade Wilson. "
@@ -188,9 +179,8 @@ SYSTEM_PROMPT = (
     "Keep responses short and punchy. Never ramble."
 )
 
-# ──────────────────────────────────────────────
+
 # 10. PROMPT BUILDER
-# ──────────────────────────────────────────────
 def build_prompt(user_input: str) -> str:
     system_block = SYSTEM_PROMPT
 
@@ -211,9 +201,7 @@ def build_prompt(user_input: str) -> str:
         messages, tokenize=False, add_generation_prompt=True,
     )
 
-# ──────────────────────────────────────────────
 # 11. ROUTES
-# ──────────────────────────────────────────────
 @app.route("/")
 def home():
     return render_template("index.html")
