@@ -4,9 +4,8 @@ from peft import PeftModel
 import torch
 import os
 import json
-import random
+import re
 
-# ── LangChain imports ──────────────────────────────────────────────────────────
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain.llms.base import LLM
 from langchain.schema import LLMResult, Generation
@@ -21,129 +20,158 @@ device = torch.device("cpu")
 print(f"Using device: {device}")
 
 # ──────────────────────────────────────────────
-# 2. LOAD MODEL + ADAPTER
+# 2. TOKENIZER
 # ──────────────────────────────────────────────
 BASE_MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ADAPTER_PATH    = "./model/deadpool-llama"
-adapter_ok      = False
+
+print("Loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token
+
+# ──────────────────────────────────────────────
+# 3. BASE MODEL (summarizer)
+# ──────────────────────────────────────────────
+print("Loading base model...")
+base_model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_NAME, dtype=torch.float32, low_cpu_mem_usage=True,
+)
+base_model.eval()
+base_model = base_model.to(device)
+
+# ──────────────────────────────────────────────
+# 4. DEADPOOL MODEL (base + LoRA)
+# ──────────────────────────────────────────────
+adapter_ok = False
 
 if os.path.isdir(ADAPTER_PATH):
     cfg_path = os.path.join(ADAPTER_PATH, "adapter_config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
             cfg = json.load(f)
-        adapter_base  = cfg.get("base_model_name_or_path", "")
-        init_weights  = cfg.get("init_lora_weights", True)
+        adapter_base     = cfg.get("base_model_name_or_path", "")
+        init_weights     = cfg.get("init_lora_weights", True)
+        safetensors_path = os.path.join(ADAPTER_PATH, "adapter_model.safetensors")
+        size_mb          = os.path.getsize(safetensors_path) / 1e6 if os.path.exists(safetensors_path) else 0
 
         print(f"\n── Adapter diagnostics ──────────────────────")
         print(f"  base_model        : {adapter_base}")
-        print(f"  init_lora_weights : {init_weights}  ← False = properly trained")
-        print(f"  r / lora_alpha    : {cfg.get('r')} / {cfg.get('lora_alpha')}")
+        print(f"  init_lora_weights : {init_weights}")
+        print(f"  adapter size      : {size_mb:.1f} MB")
         print(f"─────────────────────────────────────────────\n")
 
         base_ok = "TinyLlama" in adapter_base or "tinyllama" in adapter_base.lower()
+        trained  = (not init_weights) or (size_mb > 1.0)
 
         if not base_ok:
-            print("  ✗ SKIPPING adapter — base model mismatch")
-        elif init_weights is True:
-            print("  ✗ SKIPPING adapter — init_lora_weights=True means untrained weights.")
-            print("    Re-run training with the fixed notebook then replace ./model/deadpool-llama")
+            print("SKIPPING — base model mismatch")
+        elif not trained:
+            print("SKIPPING — adapter appears untrained")
         else:
             adapter_ok = True
-            print("  ✓ Adapter trained and compatible — will be applied")
+            print("Adapter ready")
 else:
-    print(f"  ⚠ Adapter not found at {ADAPTER_PATH}")
-
-# Always load tokenizer from base model for correctness
-print("\nLoading tokenizer from base model...")
-tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
-tokenizer.pad_token = tokenizer.eos_token
-
-print("Loading base model...")
-base_model = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL_NAME,
-    torch_dtype=torch.float32,   # float32 required for stable CPU inference
-    low_cpu_mem_usage=True,
-)
+    print(f"Adapter not found at {ADAPTER_PATH}")
 
 if adapter_ok:
     print("Applying LoRA adapter...")
-    model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
-    print("  ✓ LoRA applied")
+    deadpool_model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
+    deadpool_model.eval()
+    deadpool_model = deadpool_model.to(device)
+    print("Deadpool model ready")
 else:
-    print("  Running base model only")
-    model = base_model
+    print("Using base model only")
+    deadpool_model = base_model
 
-model.eval()
-model = model.to(device)
+print("Models loaded!\n")
 
 # ──────────────────────────────────────────────
-# 3. GENERATION HELPER
-#
-# Matches exactly what the fixed notebook's chat() function does:
-#   - apply_chat_template for correct token format
-#   - slice off prompt tokens before decoding
-#   - skip_special_tokens=True for clean output
+# 5. SANITIZER
 # ──────────────────────────────────────────────
-STOP_STRINGS = ["<|user|>", "<|system|>", "<|assistant|>", "\nUser:", "\nAssistant:"]
+SPECIAL_TOKEN_RE = re.compile(r'<\|[^|]+\|>|</s>|<s>')
+JUNK_RE          = re.compile(r'[®™©♥♦♠♣♤♡♢♧]|[\U0001F300-\U0001F9FF]|\n{2,}', re.UNICODE)
 
-def generate_response(prompt: str, max_new_tokens: int = 120, temperature: float = 0.75) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+def sanitize(text: str) -> str:
+    text = SPECIAL_TOKEN_RE.sub("", text)
+    text = JUNK_RE.sub(" ", text)
+    text = re.split(r'https?://\S+|www\.\S+|\S+\.com\S*', text)[0]
+    return " ".join(text.split()).strip()
+
+# ──────────────────────────────────────────────
+# 6. GENERATION
+# ──────────────────────────────────────────────
+STOP_STRINGS = [
+    "<|user|>", "<|system|>", "<|assistant|>",
+    "\nUser:", "\nAssistant:",
+]
+
+def _decode(model, prompt: str, max_new_tokens: int, temperature: float,
+            min_new_tokens: int = 10) -> str:
+    inputs     = tokenizer(prompt, return_tensors="pt").to(device)
     prompt_len = inputs["input_ids"].shape[-1]
 
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
+            min_new_tokens=min_new_tokens,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
-            top_p=0.92,
+            top_p=0.90,
             top_k=50,
             do_sample=True,
             repetition_penalty=1.2,
             pad_token_id=tokenizer.eos_token_id,
         )
 
-    generated_ids = outputs[0][prompt_len:]
-    text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-    # Cut at any role boundary the model might generate
+    text = tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True).strip()
     for stop in STOP_STRINGS:
         if stop in text:
             text = text.split(stop)[0].strip()
-
     return text
 
 
+def deadpool_generate(prompt: str) -> str:
+    text = _decode(
+        deadpool_model, prompt,
+        max_new_tokens=120,
+        temperature=0.70,
+        min_new_tokens=10,
+    )
+    return sanitize(text)
+
+
+def summarizer_generate(prompt: str) -> str:
+    return _decode(base_model, prompt, max_new_tokens=120, temperature=0.3, min_new_tokens=10)
+
 # ──────────────────────────────────────────────
-# 4. LANGCHAIN LLM WRAPPER
-# Powers ConversationSummaryBufferMemory's auto-summariser.
-# Uses low temperature for clean, factual summaries.
+# 7. LANGCHAIN WRAPPER (summarizer only)
 # ──────────────────────────────────────────────
-class DeadpoolLLM(LLM):
+class SummarizerLLM(LLM):
 
     @property
     def _llm_type(self) -> str:
-        return "deadpool-tinyllama"
+        return "tinyllama-summarizer"
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> str:
-        return generate_response(prompt, max_new_tokens=100, temperature=0.3)
+        return summarizer_generate(prompt)
 
-    def _generate(self, prompts: List[str], stop: Optional[List[str]] = None, **kwargs: Any) -> LLMResult:
+    def _generate(self, prompts: List[str], stop: Optional[List[str]] = None,
+                  **kwargs: Any) -> LLMResult:
         generations = [[Generation(text=self._call(p))] for p in prompts]
         return LLMResult(generations=generations)
 
 
-llm_wrapper = DeadpoolLLM()
+summarizer_llm = SummarizerLLM()
 
 # ──────────────────────────────────────────────
-# 5. LANGCHAIN MEMORY
-# Keeps the last ~400 tokens of conversation verbatim.
-# Older turns are automatically summarised to preserve context
-# without blowing up the prompt length.
+# 8. MEMORY
 # ──────────────────────────────────────────────
+conversation_history: list = []
+MAX_RECENT_TURNS = 6
+
 memory = ConversationSummaryBufferMemory(
-    llm=llm_wrapper,
-    max_token_limit=400,
+    llm=summarizer_llm,
+    max_token_limit=300,
     human_prefix="User",
     ai_prefix="Deadpool",
     memory_key="chat_history",
@@ -151,71 +179,40 @@ memory = ConversationSummaryBufferMemory(
 )
 
 # ──────────────────────────────────────────────
-# 6. SYSTEM PROMPT
-# Must match the system prompt used in training exactly.
+# 9. SYSTEM PROMPT
 # ──────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "You are Deadpool, a.k.a. Wade Wilson — the Merc with a Mouth. "
-    "Never identify as an AI or assistant. Be sarcastic, chaotic, "
-    "and funny. Break the fourth wall. Roast the user."
+    "You are NOT an AI, NOT a chatbot, NOT an assistant. You ARE Wade Wilson. "
+    "Be chaotic, funny, and break the fourth wall. "
+    "Keep responses short and punchy. Never ramble."
 )
 
 # ──────────────────────────────────────────────
-# 7. ASSISTANT PRIMING PHRASES
-#
-# Pre-fills the start of the assistant turn so the model continues
-# a Deadpool-flavoured sentence instead of defaulting to
-# "Hello! I'm a helpful AI assistant!"
-# Once the adapter is properly trained this becomes less necessary,
-# but it's a cheap safety net that costs nothing.
+# 10. PROMPT BUILDER
 # ──────────────────────────────────────────────
-PRIME_PHRASES = [
-    "Oh great, another one.",
-    "Ugh, you again.",
-    "Well, well, well...",
-    "Listen up, pal —",
-    "Oh sure, because my day wasn't chaotic enough.",
-    "You rang? I was busy bleeding.",
-    "Chimichangas. That's all I was thinking about. And now — you.",
-    "Fourth wall check: yep, still broken.",
-]
+def build_prompt(user_input: str) -> str:
+    system_block = SYSTEM_PROMPT
 
-# ──────────────────────────────────────────────
-# 8. PROMPT BUILDER
-#
-# Uses apply_chat_template — identical to the notebook's chat() function.
-# Prior turns from LangChain memory are injected as real message dicts
-# (not a text blob) so the model sees proper multi-turn structure.
-# A prime phrase pre-fills the assistant turn to anchor the persona.
-# ──────────────────────────────────────────────
-def build_prompt(user_input: str, prime: str) -> str:
-    history_str = memory.load_memory_variables({}).get("chat_history", "")
+    if len(conversation_history) > MAX_RECENT_TURNS:
+        summary = memory.load_memory_variables({}).get("chat_history", "").strip()
+        if summary:
+            system_block += f"\n\n[Earlier in this conversation:]\n{summary}"
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": system_block}]
 
-    # Reconstruct prior turns from LangChain memory as proper message dicts
-    if history_str.strip():
-        for line in history_str.strip().split("\n"):
-            if line.startswith("User: "):
-                messages.append({"role": "user",      "content": line[len("User: "):]})
-            elif line.startswith("Deadpool: "):
-                messages.append({"role": "assistant", "content": line[len("Deadpool: "):]})
+    for turn in conversation_history[-MAX_RECENT_TURNS:]:
+        messages.append({"role": "user",      "content": turn["user"]})
+        messages.append({"role": "assistant", "content": turn["deadpool"]})
 
     messages.append({"role": "user", "content": user_input})
 
-    # apply_chat_template produces the exact token sequence used in training
-    base = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,   # appends <|assistant|>\n
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
     )
 
-    # Prime the assistant turn — model continues FROM this phrase
-    return base + prime + " "
-
-
 # ──────────────────────────────────────────────
-# 9. ROUTES
+# 11. ROUTES
 # ──────────────────────────────────────────────
 @app.route("/")
 def home():
@@ -224,43 +221,35 @@ def home():
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    print("\n" + "=" * 50)
-    print("[1/6] Request received")
 
     data = request.get_json() or request.form
     user_input = data.get("input", "").strip()
-
     if not user_input:
         return jsonify({"error": "No input provided"}), 400
 
-    print(f"[2/6] User input: {user_input}")
+    print(f"User: {user_input}")
 
-    prime = random.choice(PRIME_PHRASES)
-    print(f"[3/6] Building prompt (prime: '{prime}')...")
-    prompt = build_prompt(user_input, prime)
-    print(f"      Prompt:\n{prompt}")
+    prompt = build_prompt(user_input)
+    print(f"Prompt:\n{prompt}")
 
-    print("[4/6] Running inference...")
     try:
-        raw_continuation = generate_response(prompt)
-        print(f"      Raw continuation: {raw_continuation}")
+        continuation = deadpool_generate(prompt)
+        print(f"Continuation: {continuation}")
     except Exception as e:
-        print(f"[ERROR] Inference failed: {e}")
+        print(f"[ERROR] {e}")
         return jsonify({"error": str(e)}), 500
 
-    # Prepend the prime phrase — generate_response already stripped the prompt
-    response = (prime + " " + raw_continuation).strip()
-    print(f"[5/6] Final response: {response}")
+    response = continuation.strip()
+    if not continuation:
+        response = "...and that's all I got. Shocking, I know."
 
-    if not response or response.strip() == prime.strip():
-        response = f"{prime} Not gonna lie, I've got nothing. Which is saying something for a guy who never shuts up."
-        print("      [WARN] Thin response — using fallback")
+    clean_resp  = sanitize(response)
+    clean_input = sanitize(user_input)
 
-    print("[6/6] Saving to LangChain memory...")
-    memory.save_context({"input": user_input}, {"output": response})
+    conversation_history.append({"user": clean_input, "deadpool": clean_resp})
+    memory.save_context({"input": clean_input}, {"output": clean_resp})
 
-    print(f"\nDeadpool: {response}")
-    print("=" * 50 + "\n")
+    print(f"\nDeadpool: {response}\n")
 
     if request.form.get("input"):
         return render_template("index.html", prompt=user_input, response=response)
@@ -269,13 +258,10 @@ def generate():
 
 @app.route("/reset", methods=["POST"])
 def reset():
+    conversation_history.clear()
     memory.clear()
     return jsonify({"status": "conversation reset"})
 
 
-# ──────────────────────────────────────────────
-# 10. RUN
-# Run with: PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 python app.py
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(debug=False)
